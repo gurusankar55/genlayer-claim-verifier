@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+
 from gltest.direct import VMContext, deploy_contract
 
 
@@ -10,7 +11,30 @@ def test_verify_claim():
         r"https://example\.com/earth",
         {
             "status": 200,
-            "body": "The Earth is round. This source confirms that the Earth is approximately spherical.",
+            "body": (
+                "The Earth is round. "
+                "This source confirms that the Earth is approximately spherical."
+            ),
+        },
+    )
+
+    vm.mock_web(
+        r"https://example\.org/science",
+        {
+            "status": 200,
+            "body": (
+                "Scientific observations describe Earth as approximately spherical."
+            ),
+        },
+    )
+
+    vm.mock_web(
+        r"https://example\.net/facts",
+        {
+            "status": 200,
+            "body": (
+                "Earth has a roughly spherical shape."
+            ),
         },
     )
 
@@ -19,8 +43,15 @@ def test_verify_claim():
         json.dumps(
             {
                 "result": "VERIFIED",
-                "explanation": "The supplied source evidence supports the claim.",
-                "evidence_url": "https://example.com/earth",
+                "explanation": (
+                    "The three supplied sources consistently "
+                    "support the claim."
+                ),
+                "evidence_url": (
+                    "https://example.com/earth,"
+                    "https://example.org/science,"
+                    "https://example.net/facts"
+                ),
             }
         ),
     )
@@ -33,7 +64,9 @@ def test_verify_claim():
 
         result = contract.verify_claim(
             "The Earth is round.",
-            "https://example.com/earth"
+            "https://example.com/earth",
+            "https://example.org/science",
+            "https://example.net/facts",
         )
 
         print("RESULT:", result)
@@ -41,4 +74,10 @@ def test_verify_claim():
         assert result is not None
         assert result["claim"] == "The Earth is round."
         assert result["result"] == "VERIFIED"
-        assert result["evidence_url"] == "https://example.com/earth"
+        assert result["verification_count"] == "1"
+
+        stored = contract.get_claim_result(
+            "The Earth is round."
+        )
+
+        assert stored != ""
