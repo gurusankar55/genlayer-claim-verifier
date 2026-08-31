@@ -187,8 +187,21 @@ UNCERTAIN is the safe result.
 
         parsed = result
 
-        if not isinstance(parsed, dict):
+if isinstance(parsed, str):
+    try:
+        parsed = json.loads(parsed)
+    except Exception:
+        match = re.search(r"\{.*\}", parsed, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except Exception:
+                raise Exception("Invalid verification response")
+        else:
             raise Exception("Invalid verification response")
+
+if not isinstance(parsed, dict):
+    raise Exception("Invalid verification response")
 
         if parsed["result"] not in [
             "VERIFIED",
