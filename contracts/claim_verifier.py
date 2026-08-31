@@ -24,6 +24,9 @@ class ClaimVerifier(gl.Contract):
         self.evidence_url = ""
         self.verification_count = u256(0)
 
+        self.claim_results = TreeMap()
+        self.claim_evidence = TreeMap()
+
     @gl.public.write
     def verify_claim(
         self,
