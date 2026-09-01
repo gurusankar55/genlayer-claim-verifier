@@ -13,9 +13,15 @@ class ClaimVerifier(gl.Contract):
     evidence_url: str
     verification_count: u256
 
-    # Reusable claim-specific state
-    claim_results: TreeMap[str, str]
-    claim_evidence: TreeMap[str, str]
+    # Versioned verification records.
+    # IMPORTANT: records are never overwritten.
+    claim_versions: TreeMap[str, str]
+
+    # Latest version pointer for each claim.
+    claim_latest_version: TreeMap[str, u256]
+
+    # Versioned source evidence.
+    claim_evidence_versions: TreeMap[str, str]
 
     def __init__(self):
         self.claim = ""
@@ -24,8 +30,52 @@ class ClaimVerifier(gl.Contract):
         self.evidence_url = ""
         self.verification_count = u256(0)
 
-        self.claim_results = TreeMap()
-        self.claim_evidence = TreeMap()
+        self.claim_versions = TreeMap()
+        self.claim_latest_version = TreeMap()
+        self.claim_evidence_versions = TreeMap()
+
+    def _normalize_url(self, url: str) -> str:
+        url = url.strip()
+
+        if not url:
+            raise Exception("Source URL cannot be empty")
+
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            raise Exception(
+                "Source URL must use http:// or https://"
+            )
+
+        # Reject URLs containing credentials.
+        if re.match(
+            r"^https?://[^/]*@",
+            url,
+            re.IGNORECASE
+        ):
+            raise Exception(
+                "Source URL credentials are not allowed"
+            )
+
+        # Remove trailing whitespace/slashes only.
+        url = url.rstrip()
+
+        return url
+
+    def _source_host(self, url: str) -> str:
+        match = re.match(
+            r"^https?://([^/:?#]+)",
+            url,
+            re.IGNORECASE
+        )
+
+        if not match:
+            raise Exception("Unable to determine source host")
+
+        host = match.group(1).lower()
+
+        if host.startswith("www."):
+            host = host[4:]
+
+        return host
 
     @gl.public.write
     def verify_claim(
@@ -36,61 +86,117 @@ class ClaimVerifier(gl.Contract):
         source_url_3: str
     ) -> typing.Any:
 
-        if not claim.strip():
+        claim = claim.strip()
+
+        if not claim:
             raise Exception("Claim cannot be empty")
 
+        # ---------------------------------------------------------
+        # 1. Normalize and validate supplied source URLs
+        # ---------------------------------------------------------
+
         urls = [
-            source_url_1.strip(),
-            source_url_2.strip(),
-            source_url_3.strip(),
+            self._normalize_url(source_url_1),
+            self._normalize_url(source_url_2),
+            self._normalize_url(source_url_3),
         ]
 
+        # Exact URL duplicates are forbidden.
         if len(set(urls)) != 3:
-            raise Exception("Three independent source URLs are required")
+            raise Exception(
+                "Three distinct source URLs are required"
+            )
 
-        for url in urls:
-            if not url:
-                raise Exception("Source URL cannot be empty")
+        # ---------------------------------------------------------
+        # 2. Enforce source provenance / independence
+        # ---------------------------------------------------------
+
+        hosts = [
+            self._source_host(url)
+            for url in urls
+        ]
+
+        # Same hostname cannot be counted as independent.
+        if len(set(hosts)) != 3:
+            raise Exception(
+                "Three independent source domains are required"
+            )
+
+        provenance = [
+            {
+                "url": urls[0],
+                "host": hosts[0],
+            },
+            {
+                "url": urls[1],
+                "host": hosts[1],
+            },
+            {
+                "url": urls[2],
+                "host": hosts[2],
+            },
+        ]
 
         def normalize_evidence(text: str) -> str:
             text = text.replace("\x00", " ")
             text = re.sub(r"\s+", " ", text)
             return text.strip()
 
+        # ---------------------------------------------------------
+        # 3. Fetch evidence inside nondeterministic block
+        # ---------------------------------------------------------
+
         def fetch_sources() -> str:
             sources = []
 
-            for url in urls:
+            for item in provenance:
+                url = item["url"]
+                host = item["host"]
+
                 try:
                     response = gl.nondet.web.get(url)
 
-                    status = getattr(response, "status_code", 200)
-                    body = response.body.decode("utf-8")
+                    status = getattr(
+                        response,
+                        "status_code",
+                        200
+                    )
+
+                    body = response.body.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
 
                     normalized = normalize_evidence(body)
 
                     if status >= 400:
                         sources.append({
                             "url": url,
+                            "host": host,
                             "status": "FAILED",
                             "evidence": "",
                         })
+
                     elif not normalized:
                         sources.append({
                             "url": url,
+                            "host": host,
                             "status": "EMPTY",
                             "evidence": "",
                         })
+
                     else:
                         sources.append({
                             "url": url,
+                            "host": host,
                             "status": "OK",
                             "evidence": normalized[:12000],
                         })
 
-                except Exception as exc:
+                except Exception:
                     sources.append({
                         "url": url,
+                        "host": host,
                         "status": "FAILED",
                         "evidence": "",
                     })
@@ -101,7 +207,9 @@ class ClaimVerifier(gl.Contract):
                 separators=(",", ":")
             )
 
-        evidence_json = gl.eq_principle.strict_eq(fetch_sources)
+        evidence_json = gl.eq_principle.strict_eq(
+            fetch_sources
+        )
 
         sources = json.loads(evidence_json)
 
@@ -123,6 +231,10 @@ class ClaimVerifier(gl.Contract):
             separators=(",", ":")
         )
 
+        # ---------------------------------------------------------
+        # 4. Source-grounded claim evaluation
+        # ---------------------------------------------------------
+
         def evaluate_claim() -> str:
             prompt = f"""
 You are a claim verification expert.
@@ -135,24 +247,26 @@ RETRIEVED SOURCE EVIDENCE:
 
 Verify the claim using ONLY the retrieved source evidence.
 
-Important rules:
+STRICT RULES:
 
 1. Do not use model memory.
 2. Do not invent facts.
-3. Treat each source independently.
-4. Use only sources whose status is OK.
-5. If the sources conflict or the evidence is insufficient,
-   return UNCERTAIN.
-6. The explanation must refer only to supplied evidence.
-7. The evidence_url must identify the source URL(s) actually
-   used for the decision.
+3. Do not use information outside the supplied evidence.
+4. Treat each retrieved source independently.
+5. Only sources with status OK may be used.
+6. If evidence conflicts, return UNCERTAIN.
+7. If evidence is insufficient, return UNCERTAIN.
+8. The explanation must be based only on supplied evidence.
+9. evidence_url MUST contain only URLs from the retrieved
+   source evidence.
+10. Do not create or modify source URLs.
 
 Return valid JSON only:
 
 {{
   "result": "VERIFIED",
   "explanation": "short evidence-based explanation",
-  "evidence_url": "URL or comma-separated URLs used"
+  "evidence_url": "URL or comma-separated URLs actually used"
 }}
 
 The result MUST be exactly one of:
@@ -169,79 +283,189 @@ UNCERTAIN
             principle="""
 The verification decision must agree.
 
-The result field must be exactly one of:
+The result must be exactly one of:
 VERIFIED, NOT_VERIFIED, UNCERTAIN.
 
 The explanation must be consistent with the retrieved
 source evidence.
 
-The evidence_url must identify URL(s) present in the
-retrieved source evidence.
+The evidence_url must contain only URLs that exist in
+the retrieved source evidence.
 
 Do not accept unsupported facts.
 
-If the evidence is insufficient or conflicting,
+If evidence is insufficient or conflicting,
 UNCERTAIN is the safe result.
 """
         )
+
+        # ---------------------------------------------------------
+        # 5. Parse and validate consensus result
+        # ---------------------------------------------------------
 
         parsed = result
 
         if isinstance(parsed, str):
             try:
                 parsed = json.loads(parsed)
+
             except Exception:
-                match = re.search(r"\{.*\}", parsed, re.DOTALL)
+                match = re.search(
+                    r"\{.*\}",
+                    parsed,
+                    re.DOTALL
+                )
+
                 if match:
                     try:
-                        parsed = json.loads(match.group(0))
+                        parsed = json.loads(
+                            match.group(0)
+                        )
                     except Exception:
-                        raise Exception("Invalid verification response")
+                        raise Exception(
+                            "Invalid verification response"
+                        )
                 else:
-                    raise Exception("Invalid verification response")
+                    raise Exception(
+                        "Invalid verification response"
+                    )
 
         if not isinstance(parsed, dict):
-            raise Exception("Invalid verification response")
+            raise Exception(
+                "Invalid verification response"
+            )
 
-        if parsed["result"] not in [
+        verification_result = parsed.get("result")
+
+        if verification_result not in [
             "VERIFIED",
             "NOT_VERIFIED",
             "UNCERTAIN"
         ]:
-            raise Exception("Invalid verification result")
+            raise Exception(
+                "Invalid verification result"
+            )
 
-        if not parsed.get("explanation"):
-            raise Exception("Missing explanation")
+        explanation = parsed.get("explanation")
+        evidence_url = parsed.get("evidence_url")
 
-        if not parsed.get("evidence_url"):
-            raise Exception("Missing evidence URL")
+        if not explanation:
+            raise Exception(
+                "Missing explanation"
+            )
 
-        self.claim = claim
-        self.result = parsed["result"]
-        self.explanation = parsed["explanation"]
-        self.evidence_url = parsed["evidence_url"]
+        if not evidence_url:
+            raise Exception(
+                "Missing evidence URL"
+            )
 
-        self.verification_count = (
+        # ---------------------------------------------------------
+        # 6. Enforce evidence_url provenance
+        # ---------------------------------------------------------
+
+        reported_urls = [
+            item.strip()
+            for item in evidence_url.split(",")
+            if item.strip()
+        ]
+
+        if not reported_urls:
+            raise Exception(
+                "No valid evidence URLs supplied"
+            )
+
+        supplied_url_set = set(urls)
+
+        for reported_url in reported_urls:
+            normalized_reported = self._normalize_url(
+                reported_url
+            )
+
+            if normalized_reported not in supplied_url_set:
+                raise Exception(
+                    "Evidence URL is not one of the supplied sources"
+                )
+
+        canonical_evidence_url = ",".join(
+            sorted(set(reported_urls))
+        )
+
+        # ---------------------------------------------------------
+        # 7. Create immutable version
+        # ---------------------------------------------------------
+
+        next_version = (
             self.verification_count + u256(1)
         )
 
-        stored_result = json.dumps({
-            "claim": self.claim,
-            "result": self.result,
-            "explanation": self.explanation,
-            "evidence_url": self.evidence_url,
-            "verification_count": str(self.verification_count),
-        })
+        version_key = (
+            claim
+            + "::version::"
+            + str(next_version)
+        )
 
-        self.claim_results[claim] = stored_result
-        self.claim_evidence[claim] = evidence_json
+        # The version key is generated by the contract.
+        # The caller cannot choose it.
+        if self.claim_versions.get(
+            version_key,
+            ""
+        ):
+            raise Exception(
+                "Verification version already exists"
+            )
+
+        # ---------------------------------------------------------
+        # 8. Build immutable verification record
+        # ---------------------------------------------------------
+
+        stored_result = json.dumps({
+            "claim": claim,
+            "version": str(next_version),
+            "result": verification_result,
+            "explanation": explanation,
+            "evidence_url": canonical_evidence_url,
+            "source_provenance": provenance,
+        }, sort_keys=True)
+
+        stored_evidence = json.dumps({
+            "claim": claim,
+            "version": str(next_version),
+            "sources": sources,
+        }, sort_keys=True)
+
+        # ---------------------------------------------------------
+        # 9. Write versioned records.
+        #    NEVER overwrite previous verification records.
+        # ---------------------------------------------------------
+
+        self.claim_versions[version_key] = stored_result
+
+        self.claim_evidence_versions[
+            version_key
+        ] = stored_evidence
+
+        self.claim_latest_version[
+            claim
+        ] = next_version
+
+        # Global immutable verification counter.
+        self.verification_count = next_version
+
+        # Current/latest convenience state.
+        self.claim = claim
+        self.result = verification_result
+        self.explanation = explanation
+        self.evidence_url = canonical_evidence_url
 
         return {
-            "claim": self.claim,
-            "result": self.result,
-            "explanation": self.explanation,
-            "evidence_url": self.evidence_url,
-            "verification_count": str(self.verification_count),
+            "claim": claim,
+            "version": str(next_version),
+            "result": verification_result,
+            "explanation": explanation,
+            "evidence_url": canonical_evidence_url,
+            "verification_count": str(
+                self.verification_count
+            ),
         }
 
     @gl.public.view
@@ -251,13 +475,68 @@ UNCERTAIN is the safe result.
             "result": self.result,
             "explanation": self.explanation,
             "evidence_url": self.evidence_url,
-            "verification_count": str(self.verification_count),
+            "verification_count": str(
+                self.verification_count
+            ),
         }
 
     @gl.public.view
-    def get_claim_result(self, claim: str) -> str:
-        return self.claim_results.get(claim, "")
+    def get_claim_version(
+        self,
+        claim: str,
+        version: u256
+    ) -> str:
+
+        version_key = (
+            claim
+            + "::version::"
+            + str(version)
+        )
+
+        return self.claim_versions.get(
+            version_key,
+            ""
+        )
 
     @gl.public.view
-    def get_claim_evidence(self, claim: str) -> str:
-        return self.claim_evidence.get(claim, "")
+    def get_claim_evidence_version(
+        self,
+        claim: str,
+        version: u256
+    ) -> str:
+
+        version_key = (
+            claim
+            + "::version::"
+            + str(version)
+        )
+
+        return self.claim_evidence_versions.get(
+            version_key,
+            ""
+        )
+
+    @gl.public.view
+    def get_latest_claim_version(
+        self,
+        claim: str
+    ) -> str:
+
+        version = self.claim_latest_version.get(
+            claim,
+            u256(0)
+        )
+
+        if version == u256(0):
+            return ""
+
+        version_key = (
+            claim
+            + "::version::"
+            + str(version)
+        )
+
+        return self.claim_versions.get(
+            version_key,
+            ""
+        )
