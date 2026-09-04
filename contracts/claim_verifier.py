@@ -13,8 +13,9 @@ class ClaimVerifier(gl.Contract):
     # Each exact host maps to a publisher identity.
     TRUSTED_SOURCES = {
         "science.nasa.gov": "NASA",
-        "www.nasa.gov": "NASA",
-        "earthobservatory.nasa.gov": "NASA",
+"nasa.gov": "NASA",
+"www.nasa.gov": "NASA",
+"earthobservatory.nasa.gov": "NASA",
         "usgs.gov": "USGS",
         "www.usgs.gov": "USGS",
         "noaa.gov": "NOAA",
