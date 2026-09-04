@@ -158,14 +158,17 @@ class ClaimVerifier(gl.Contract):
             {
                 "url": urls[0],
                 "host": hosts[0],
+                "publisher": publisher_ids[0],
             },
             {
                 "url": urls[1],
                 "host": hosts[1],
+                "publisher": publisher_ids[1],
             },
             {
                 "url": urls[2],
                 "host": hosts[2],
+                "publisher": publisher_ids[2],
             },
         ]
 
