@@ -8,6 +8,27 @@ import typing
 
 
 class ClaimVerifier(gl.Contract):
+
+    # Contract-enforced trusted source registry.
+    # Each exact host maps to a publisher identity.
+    TRUSTED_SOURCES = {
+        "science.nasa.gov": "NASA",
+        "www.nasa.gov": "NASA",
+        "earthobservatory.nasa.gov": "NASA",
+        "usgs.gov": "USGS",
+        "www.usgs.gov": "USGS",
+        "noaa.gov": "NOAA",
+        "www.noaa.gov": "NOAA",
+        "who.int": "WHO",
+        "www.who.int": "WHO",
+        "britannica.com": "BRITANNICA",
+        "www.britannica.com": "BRITANNICA",
+        "reuters.com": "REUTERS",
+        "www.reuters.com": "REUTERS",
+        "apnews.com": "AP",
+        "www.apnews.com": "AP",
+    }
+
     claim: str
     result: str
     explanation: str
@@ -109,7 +130,7 @@ class ClaimVerifier(gl.Contract):
             )
 
         # ---------------------------------------------------------
-        # 2. Enforce independent source domains
+        # 2. Enforce trusted and independent source publishers
         # ---------------------------------------------------------
 
         hosts = [
@@ -117,10 +138,21 @@ class ClaimVerifier(gl.Contract):
             for url in urls
         ]
 
-        if len(set(hosts)) != 3:
+        publisher_ids = [
+            self.TRUSTED_SOURCES.get(host, "")
+            for host in hosts
+        ]
+
+        if "" in publisher_ids:
             raise gl.vm.UserError(
-                "Three independent source domains are required"
+                "All source hosts must belong to the trusted source registry"
             )
+
+        if len(set(publisher_ids)) != 3:
+            raise gl.vm.UserError(
+                "Three independent trusted source publishers are required"
+            )
+
 
         provenance = [
             {
@@ -179,6 +211,7 @@ class ClaimVerifier(gl.Contract):
             for item in provenance:
                 url = item["url"]
                 host = item["host"]
+                publisher = item["publisher"]
 
                 try:
                     response = gl.nondet.web.get(url)
@@ -200,6 +233,7 @@ class ClaimVerifier(gl.Contract):
                         sources.append({
                             "url": url,
                             "host": host,
+                            "publisher": publisher,
                             "status": "FAILED",
                             "evidence": "",
                         })
@@ -208,7 +242,29 @@ class ClaimVerifier(gl.Contract):
                         sources.append({
                             "url": url,
                             "host": host,
+                            "publisher": publisher,
                             "status": "EMPTY",
+                            "evidence": "",
+                        })
+
+                    elif any(
+                        marker in normalized.lower()
+                        for marker in [
+                            "just a moment",
+                            "enable javascript",
+                            "enable cookies",
+                            "access denied",
+                            "captcha",
+                            "robot verification",
+                            "verify you are human",
+                            "checking your browser",
+                        ]
+                    ):
+                        sources.append({
+                            "url": url,
+                            "host": host,
+                            "publisher": publisher,
+                            "status": "UNUSABLE",
                             "evidence": "",
                         })
 
@@ -216,6 +272,7 @@ class ClaimVerifier(gl.Contract):
                         sources.append({
                             "url": url,
                             "host": host,
+                            "publisher": publisher,
                             "status": "OK",
                             "evidence": normalized[:12000],
                         })
@@ -224,6 +281,7 @@ class ClaimVerifier(gl.Contract):
                     sources.append({
                         "url": url,
                         "host": host,
+                        "publisher": publisher,
                         "status": "FAILED",
                         "evidence": "",
                     })
@@ -235,10 +293,18 @@ class ClaimVerifier(gl.Contract):
             )
 
         evidence_json = gl.eq_principle.prompt_comparative(
-    fetch_sources,
-    principle="""
-The source records must represent the same requested URLs
-and preserve the same source hosts and HTTP status.
+            fetch_sources,
+            principle="""
+The source records must represent the same requested URLs.
+
+Each record must preserve exactly the same:
+- source URL
+- source host
+- trusted publisher identity
+- HTTP status
+
+The trusted publisher identity is contract-assigned and must
+not be changed, inferred, substituted, or invented by validators.
 
 Small differences in HTML formatting, scripts, metadata,
 whitespace, or dynamic webpage content are acceptable.
@@ -246,11 +312,44 @@ whitespace, or dynamic webpage content are acceptable.
 The underlying factual evidence relevant to the claim must
 remain consistent across validators.
 
-Do not invent evidence or URLs.
+Do not invent evidence, URLs, hosts, publishers, or statuses.
 """
-)
+        )
 
         sources = json.loads(evidence_json)
+
+        # Re-enforce contract-assigned publisher provenance
+        # after consensus. Validators must not alter source identity.
+        if len(sources) != 3:
+            raise gl.vm.UserError(
+                "Exactly three source records are required"
+            )
+
+        for index, source in enumerate(sources):
+            if source.get("url") != urls[index]:
+                raise gl.vm.UserError(
+                    "Consensus changed a source URL"
+                )
+
+            if source.get("host") != hosts[index]:
+                raise gl.vm.UserError(
+                    "Consensus changed a source host"
+                )
+
+            if source.get("publisher") != publisher_ids[index]:
+                raise gl.vm.UserError(
+                    "Consensus changed a trusted publisher identity"
+                )
+
+        if len(
+            set(
+                source.get("publisher", "")
+                for source in sources
+            )
+        ) != 3:
+            raise gl.vm.UserError(
+                "Consensus must preserve three independent trusted publishers"
+            )
 
         usable_sources = [
             source
